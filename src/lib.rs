@@ -1,14 +1,34 @@
-pub fn add(left: usize, right: usize) -> usize {
-    left + right
+pub mod builder;
+pub mod lookup;
+pub mod prover;
+pub mod system;
+pub mod types;
+pub mod verifier;
+
+#[macro_export]
+macro_rules! ensure {
+    ($condition:expr, $err:expr) => {
+        if !$condition {
+            eprintln!("assertion failed on file {} line {}", file!(), line!());
+            return std::result::Result::Err($err.into());
+        }
+    };
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+#[macro_export]
+macro_rules! ensure_eq {
+    ($a:expr, $b:expr, $err:expr) => {
+        $crate::ensure!($a == $b, $err);
+    };
+}
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
+#[macro_export]
+macro_rules! benchmark {
+    ($bench:expr, $msg:expr $(,$msg_args:expr)*) => {{
+        let now = std::time::Instant::now();
+        let result = std::hint::black_box($bench);
+        print!($msg $(,$msg_args)*);
+        println!("{:?}", now.elapsed());
+        result
+    }};
 }
