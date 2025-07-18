@@ -1,9 +1,10 @@
 use crate::{
     builder::folder::ProverConstraintFolder,
-    system::{Name, System, SystemWitness},
+    lookup::Lookup,
+    system::{System, SystemWitness},
     types::{Challenger, Domain, ExtVal, PackedExtVal, PackedVal, Pcs, StarkConfig, Val},
 };
-use p3_air::{Air, BaseAirWithPublicValues};
+use p3_air::{Air, BaseAir};
 use p3_challenger::{CanObserve, FieldChallenger};
 use p3_commit::{OpenedValuesForRound, Pcs as PcsTrait, PolynomialSpace};
 use p3_field::{BasedVectorSpace, Field, PackedValue, PrimeCharacteristicRing};
@@ -14,8 +15,18 @@ use serde::{Deserialize, Serialize};
 use std::{cmp::min, iter::once};
 
 pub struct Claim {
-    pub circuit_name: Name,
+    pub circuit_idx: usize,
     pub args: Vec<Val>,
+}
+
+impl Claim {
+    #[inline]
+    pub fn empty() -> Self {
+        Self {
+            circuit_idx: 0,
+            args: vec![],
+        }
+    }
 }
 
 type Commitment = <Pcs as PcsTrait<ExtVal, Challenger>>::Commitment;
@@ -39,14 +50,18 @@ pub struct Proof {
     pub stage_2_opened_values: OpenedValuesForRound<ExtVal>,
 }
 
-impl<A: BaseAirWithPublicValues<Val> + for<'a> Air<ProverConstraintFolder<'a>>> System<A> {
-    #[allow(clippy::type_complexity)]
-    pub fn prove(
+impl<A: BaseAir<Val> + for<'a> Air<ProverConstraintFolder<'a>>> System<A> {
+    pub fn prove(&self, config: &StarkConfig, claim: &Claim, witness: SystemWitness) -> Proof {
+        let multiplicity = Val::ONE;
+        self.prove_with_claim_multiplicy(config, multiplicity, claim, witness)
+    }
+
+    pub fn prove_with_claim_multiplicy(
         &self,
         config: &StarkConfig,
+        multiplicity: Val,
         claim: &Claim,
-        stage_1_witness: SystemWitness<Val>,
-        stage_2_witness: Box<dyn FnOnce(&[Val], &mut Vec<Val>) -> SystemWitness<Val>>,
+        witness: SystemWitness,
     ) -> Proof {
         // initialize pcs and challenger
         let pcs = config.pcs();
@@ -54,8 +69,7 @@ impl<A: BaseAirWithPublicValues<Val> + for<'a> Air<ProverConstraintFolder<'a>>> 
 
         // commit to stage 1 traces
         let mut log_degrees = vec![];
-        let evaluations = stage_1_witness.circuits.into_iter().map(|witness| {
-            let trace = witness.trace;
+        let evaluations = witness.traces.into_iter().map(|trace| {
             let degree = trace.height();
             let log_degree = log2_strict_usize(degree);
             let trace_domain =
@@ -71,7 +85,7 @@ impl<A: BaseAirWithPublicValues<Val> + for<'a> Air<ProverConstraintFolder<'a>>> 
         // observe the claim
         // this has to be done before generating the lookup argument challenge
         // otherwise the lookup argument can be attacked
-        let circuit_index = Val::from_usize(*self.circuit_names.get(&claim.circuit_name).unwrap());
+        let circuit_index = Val::from_usize(claim.circuit_idx);
         challenger.observe(circuit_index);
         challenger.observe_slice(&claim.args);
 
@@ -86,17 +100,13 @@ impl<A: BaseAirWithPublicValues<Val> + for<'a> Air<ProverConstraintFolder<'a>>> 
         let claim_iter = claim.args.iter().rev().copied().chain(once(circuit_index));
         let message =
             lookup_argument_challenge + fingerprint_reverse(fingerprint_challenge, claim_iter);
-        let mut acc = message.inverse();
+        let mut acc = multiplicity * message.inverse();
         // commit to stage 2 traces
-        let mut intermediate_accumulators = vec![];
-        let evaluations = stage_2_witness(
+        let (stage_2_traces, intermediate_accumulators) = Lookup::stage_2_traces(
+            &witness.lookups,
             &[lookup_argument_challenge, fingerprint_challenge, acc],
-            &mut intermediate_accumulators,
-        )
-        .circuits
-        .into_iter()
-        .map(|witness| {
-            let trace = witness.trace;
+        );
+        let evaluations = stage_2_traces.into_iter().map(|trace| {
             let degree = trace.height();
             let trace_domain =
                 <Pcs as PcsTrait<ExtVal, Challenger>>::natural_domain_for_degree(pcs, degree);

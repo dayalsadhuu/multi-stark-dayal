@@ -7,7 +7,7 @@ use crate::{
         TwoStagedBuilder,
         symbolic::{Entry, SymbolicExpression},
     },
-    system::{CircuitWitness, MIN_IO_SIZE, SystemWitness},
+    system::MIN_IO_SIZE,
     types::Val,
 };
 
@@ -18,16 +18,17 @@ pub struct Lookup<Expr> {
 }
 
 pub struct LookupAir<A> {
-    inner_air: A,
-}
-
-pub trait AirWithLookup<F>: BaseAir<F> {
-    fn lookups(&self) -> Vec<Lookup<SymbolicExpression<F>>>;
+    pub inner_air: A,
+    pub lookups: Vec<Lookup<SymbolicExpression<Val>>>,
 }
 
 impl<A> LookupAir<A> {
-    pub fn new(inner_air: A) -> Self {
-        Self { inner_air }
+    pub fn new(inner_air: A, lookups: Vec<Lookup<SymbolicExpression<Val>>>) -> Self {
+        Self { inner_air, lookups }
+    }
+
+    pub fn stage_2_width(&self) -> usize {
+        self.lookups.len() + 1
     }
 }
 
@@ -47,70 +48,39 @@ impl Lookup<Val> {
         );
         lookup_challenge + args
     }
-}
 
-impl SystemWitness<Val> {
-    #[allow(clippy::type_complexity)]
-    pub fn stage_2_from_symbolic_lookups(
-        &self,
-        circuit_lookups: &[Vec<Lookup<SymbolicExpression<Val>>>],
-    ) -> Box<dyn Fn(&[Val], &mut Vec<Val>) -> Self> {
-        let lookups = self
-            .circuits
-            .iter()
-            .zip(circuit_lookups.iter())
-            .map(|(circuit, lookups)| {
-                circuit
-                    .trace
-                    .row_slices()
-                    .map(|row| {
-                        lookups
-                            .iter()
-                            .map(|lookup| lookup.compute_expr(row))
-                            .collect::<Vec<_>>()
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-        self.stage_2_from_lookups(lookups)
-    }
-
-    #[allow(clippy::type_complexity)]
-    pub fn stage_2_from_lookups(
-        &self,
-        lookups: Vec<Vec<Vec<Lookup<Val>>>>,
-    ) -> Box<dyn Fn(&[Val], &mut Vec<Val>) -> Self> {
-        Box::new(move |values, intermediate_accumulators| {
-            let lookup_challenge = values[0];
-            let fingenprint_challenge = values[1];
-            let mut accumulator = values[2];
-            let circuits = lookups
+    pub fn stage_2_traces(
+        lookups: &[Vec<Vec<Self>>],
+        values: &[Val],
+    ) -> (Vec<RowMajorMatrix<Val>>, Vec<Val>) {
+        let mut intermediate_accumulators = vec![];
+        let mut traces = vec![];
+        let lookup_challenge = values[0];
+        let fingenprint_challenge = values[1];
+        let mut accumulator = values[2];
+        for lookups_per_circuit in lookups.iter() {
+            let num_lookups = lookups_per_circuit[0].len();
+            let vec = lookups_per_circuit
                 .iter()
-                .map(|lookups_per_circuit| {
-                    let num_lookups = lookups_per_circuit[0].len();
-                    let vec = lookups_per_circuit
-                        .iter()
-                        .flat_map(|lookups_per_row| {
-                            let mut row = Vec::with_capacity(lookups_per_row.len() + 1);
-                            row.push(accumulator);
-                            row.extend(lookups_per_row.iter().map(|lookup| {
-                                let inverse_of_message = lookup
-                                    .compute_message(lookup_challenge, fingenprint_challenge)
-                                    .inverse();
-                                accumulator += inverse_of_message * lookup.multiplicity;
-                                inverse_of_message
-                            }));
-                            row
-                        })
-                        .collect::<Vec<_>>();
-                    debug_assert_eq!(vec.len() % (num_lookups + 1), 0);
-                    let trace = RowMajorMatrix::new(vec, num_lookups + 1);
-                    intermediate_accumulators.push(accumulator);
-                    CircuitWitness { trace }
+                .flat_map(|lookups_per_row| {
+                    let mut row = Vec::with_capacity(lookups_per_row.len() + 1);
+                    row.push(accumulator);
+                    row.extend(lookups_per_row.iter().map(|lookup| {
+                        let inverse_of_message = lookup
+                            .compute_message(lookup_challenge, fingenprint_challenge)
+                            .inverse();
+                        accumulator += inverse_of_message * lookup.multiplicity;
+                        inverse_of_message
+                    }));
+                    row
                 })
-                .collect();
-            Self { circuits }
-        })
+                .collect::<Vec<_>>();
+            debug_assert_eq!(vec.len() % (num_lookups + 1), 0);
+            let trace = RowMajorMatrix::new(vec, num_lookups + 1);
+            intermediate_accumulators.push(accumulator);
+            traces.push(trace);
+        }
+        (traces, intermediate_accumulators)
     }
 }
 
@@ -122,6 +92,7 @@ where
         self.inner_air.width()
     }
 }
+
 impl<A> BaseAirWithPublicValues<Val> for LookupAir<A>
 where
     A: BaseAir<Val>,
@@ -133,11 +104,11 @@ where
 
 impl<A, AB> Air<AB> for LookupAir<A>
 where
-    A: Air<AB> + AirWithLookup<Val>,
+    A: Air<AB>,
     AB: AirBuilderWithPublicValues<F = Val> + TwoStagedBuilder,
 {
     fn eval(&self, builder: &mut AB) {
-        let lookups = self.inner_air.lookups();
+        let lookups = &self.lookups;
         self.inner_air.eval(builder);
         let public_values = builder.public_values();
         debug_assert_eq!(public_values.len(), MIN_IO_SIZE);
@@ -210,7 +181,7 @@ mod tests {
     use crate::{
         builder::symbolic::SymbolicVariable,
         prover::Claim,
-        system::{Circuit, System},
+        system::{Circuit, System, SystemWitness},
         types::{FriParameters, new_stark_config},
     };
 
@@ -225,31 +196,7 @@ mod tests {
             6
         }
     }
-    impl<AB> Air<AB> for CS
-    where
-        AB: AirBuilderWithPublicValues,
-        AB::Var: Copy,
-    {
-        fn eval(&self, builder: &mut AB) {
-            // both even and odd have the same constraints, they only differ on the lookups
-            let main = builder.main();
-            let local = main.row_slice(0).unwrap();
-            let multiplicity = local[0];
-            let input = local[1];
-            let input_inverse = local[2];
-            let input_is_zero = local[3];
-            let input_not_zero = local[4];
-            builder.assert_bools([input_is_zero, input_not_zero]);
-            builder
-                .when(multiplicity)
-                .assert_one(input_is_zero + input_not_zero);
-            builder.when(input_is_zero).assert_zero(input);
-            builder
-                .when(input_not_zero)
-                .assert_one(input * input_inverse);
-        }
-    }
-    impl AirWithLookup<Val> for CS {
+    impl CS {
         fn lookups(&self) -> Vec<Lookup<SymbolicExpression<Val>>> {
             let var = |index| {
                 SymbolicExpression::<Val>::from(SymbolicVariable::new(
@@ -298,18 +245,42 @@ mod tests {
             }
         }
     }
-    fn system() -> System<LookupAir<CS>> {
-        // two lookups and an accumulator
-        let stage_2_width = 3;
-        let even = Circuit::from_air(
-            LookupAir {
-                inner_air: CS::Even,
-            },
-            stage_2_width,
-        )
+    impl<AB> Air<AB> for CS
+    where
+        AB: AirBuilderWithPublicValues,
+        AB::Var: Copy,
+    {
+        fn eval(&self, builder: &mut AB) {
+            // both even and odd have the same constraints, they only differ on the lookups
+            let main = builder.main();
+            let local = main.row_slice(0).unwrap();
+            let multiplicity = local[0];
+            let input = local[1];
+            let input_inverse = local[2];
+            let input_is_zero = local[3];
+            let input_not_zero = local[4];
+            builder.assert_bools([input_is_zero, input_not_zero]);
+            builder
+                .when(multiplicity)
+                .assert_one(input_is_zero + input_not_zero);
+            builder.when(input_is_zero).assert_zero(input);
+            builder
+                .when(input_not_zero)
+                .assert_one(input * input_inverse);
+        }
+    }
+    fn system() -> System<CS> {
+        let even = Circuit::from_air(LookupAir {
+            inner_air: CS::Even,
+            lookups: CS::Even.lookups(),
+        })
         .unwrap();
-        let odd = Circuit::from_air(LookupAir { inner_air: CS::Odd }, stage_2_width).unwrap();
-        System::new([("even", even), ("odd", odd)].into_iter())
+        let odd = Circuit::from_air(LookupAir {
+            inner_air: CS::Odd,
+            lookups: CS::Odd.lookups(),
+        })
+        .unwrap();
+        System::new([even, odd])
     }
 
     #[test]
@@ -317,42 +288,39 @@ mod tests {
         let system = system();
         let f = Val::from_u32;
         #[rustfmt::skip]
-        let witness = SystemWitness {
-            circuits: vec![
-                CircuitWitness {
-                    trace: RowMajorMatrix::new(
-                        vec![
-                            // row 1
-                            f(1), f(4), f(4).inverse(), f(0), f(1), f(1),
-                            // row 2
-                            f(1), f(2), f(2).inverse(), f(0), f(1), f(1),
-                            // row 3
-                            f(1), f(0), f(0), f(1), f(0), f(0),
-                            // row 4
-                            f(0), f(0), f(0), f(0), f(0), f(0),
-                        ],
-                        6,
-                    ),
-                },
-                CircuitWitness {
-                    trace: RowMajorMatrix::new(
-                        vec![
-                            // row 1
-                            f(1), f(3), f(3).inverse(), f(0), f(1), f(1),
-                            // row 2
-                            f(1), f(1), f(1).inverse(), f(0), f(1), f(1),
-                            // row 3
-                            f(0), f(0), f(0), f(0), f(0), f(0),
-                            // row 4
-                            f(0), f(0), f(0), f(0), f(0), f(0),
-                        ],
-                        6,
-                    ),
-                },
+        let witness = SystemWitness::from_stage_1(
+            vec![
+                RowMajorMatrix::new(
+                    vec![
+                        // row 1
+                        f(1), f(4), f(4).inverse(), f(0), f(1), f(1),
+                        // row 2
+                        f(1), f(2), f(2).inverse(), f(0), f(1), f(1),
+                        // row 3
+                        f(1), f(0), f(0), f(1), f(0), f(0),
+                        // row 4
+                        f(0), f(0), f(0), f(0), f(0), f(0),
+                    ],
+                    6,
+                ),
+                RowMajorMatrix::new(
+                    vec![
+                        // row 1
+                        f(1), f(3), f(3).inverse(), f(0), f(1), f(1),
+                        // row 2
+                        f(1), f(1), f(1).inverse(), f(0), f(1), f(1),
+                        // row 3
+                        f(0), f(0), f(0), f(0), f(0), f(0),
+                        // row 4
+                        f(0), f(0), f(0), f(0), f(0), f(0),
+                    ],
+                    6,
+                ),
             ],
-        };
+            &system,
+        );
         let claim = Claim {
-            circuit_name: "even".into(),
+            circuit_idx: 0,
             args: vec![f(4), f(1)],
         };
         let fri_parameters = FriParameters {
@@ -362,9 +330,7 @@ mod tests {
             proof_of_work_bits: 0,
         };
         let config = new_stark_config(&fri_parameters);
-        let circuit_lookups = [CS::Even.lookups(), CS::Odd.lookups()];
-        let stage_2 = witness.stage_2_from_symbolic_lookups(&circuit_lookups);
-        let proof = system.prove(&config, &claim, witness, stage_2);
+        let proof = system.prove(&config, &claim, witness);
         system.verify(&config, &claim, &proof).unwrap();
     }
 }
